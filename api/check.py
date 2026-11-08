@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler
 import os
+import re
 import json
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -11,6 +12,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 TARGET_AREAS = {"강서구", "구로구", "마포구"}
+
 CACHE_FILE = "/tmp/seoul_tennis_state.json"
 MEMORY_CACHE = set()
 
@@ -39,7 +41,6 @@ def save_cache(active_keys: set):
 
 
 def send_telegram(message: str) -> dict:
-    """텔레그램 메시지 발송 및 결과 리턴"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {"ok": False, "error": "Token or Chat ID missing in environment variables"}
     
@@ -55,6 +56,21 @@ def send_telegram(message: str) -> dict:
         return res.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def is_excluded(place: str, svcnm: str) -> bool:
+    """
+    서남센터(서남물재생센터) 테니스장 중 1~4번 코트만 제외하고 5번 이상 코트는 통과
+    - 매칭 예시: '서남센터 테니스장 1번 코트', '서남물재생센터 2코트', '서남 테니스장3' 등
+    """
+    combined = f"{place} {svcnm}"
+    if "서남" in combined:
+        # '1번'~'4번', '1코트'~'4코트', '테니스장1'~'테니스장4', '1~4' 패턴 감지
+        # (단, 10번 등 두 자리 숫자나 날짜 '11월', '2026년' 등과 겹치지 않게 정규식 처리)
+        pattern = r"(?<![0-9])[1-4]\s*(번|코트|면)|테니스장\s*[1-4](?![0-9])|1\s*~\s*4"
+        if re.search(pattern, combined):
+            return True
+    return False
 
 
 def is_target_time(svcnm: str, v_max: str) -> bool:
@@ -96,7 +112,12 @@ def check_seoul_api() -> list:
             svcurl = row.get("SVCURL", "").strip()
             place = row.get("PLACENM", "").strip()
 
+            # 1. 지역 및 접수중 상태 확인
             if area in TARGET_AREAS and stat == "접수중":
+                # 2. 서남센터 1~4번 코트만 핀셋 제외 (5번 이상 코트는 유지)
+                if is_excluded(place, svcnm):
+                    continue
+                # 3. 시간대 조건 확인
                 if is_target_time(svcnm, v_max):
                     available_items.append({
                         "key": svcid,
@@ -114,20 +135,19 @@ def check_seoul_api() -> list:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # 1. 시크릿 키 검증 (설정되어 있을 경우)
         if CRON_SECRET and f"key={CRON_SECRET}" not in self.path:
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b"Unauthorized")
             return
 
-        # 2. 테스트 모드 확인 (?test=true 파라미터가 있을 때)
         if "test=true" in self.path:
             test_msg = (
                 "🎾 <b>[서울시 테니스 알리미] 텔레그램 연동 테스트 성공!</b>\n\n"
                 "• 봇 토큰 및 Chat ID가 정상 작동 중입니다.\n"
                 f"• 모니터링 대상: {', '.join(TARGET_AREAS)}\n"
-                f"• 기준: 평일 18시 이후 / 주말 전시간대\n"
+                "• 제외 조건: 서남센터 테니스장 1~4번 코트만 제외 (5번 이상 코트 포함)\n"
+                "• 기준: 평일 18시 이후 / 주말 전시간대\n"
                 f"• 확인 시각: {datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S')}"
             )
             tg_result = send_telegram(test_msg)
@@ -144,7 +164,6 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(res_data, ensure_ascii=False).encode("utf-8"))
             return
 
-        # 3. 실제 모니터링 루틴
         prev_keys = load_cache()
         current_items = check_seoul_api()
         current_keys = {item["key"] for item in current_items}
@@ -174,6 +193,7 @@ class handler(BaseHTTPRequestHandler):
             "available_count": len(current_items),
             "new_alerts_sent": len(new_items),
             "telegram_sent": telegram_sent,
+            "excluded_rule": "서남센터 1~4번 코트만 제외",
             "available_courts": [f"[{i['area']}] {i['title']}" for i in current_items],
             "timestamp": datetime.now(timezone(timedelta(hours=9))).isoformat(),
         }
