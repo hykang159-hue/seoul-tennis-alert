@@ -1,6 +1,5 @@
 from http.server import BaseHTTPRequestHandler
 import os
-import re
 import json
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -11,23 +10,32 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
+# 감시할 타겟 자치구 (필요시 인근 서대문구, 영등포구, 양천구 등 추가 가능)
 TARGET_AREAS = {"강서구", "구로구", "마포구"}
 
+# 상품명(SVCNM)에 아래 키워드 중 하나라도 반드시 포함되어야만 감시 대상에 편입
+REQUIRED_KEYWORDS = ["주말", "토/일", "토·일", "토요일", "일요일", "공휴일", "휴일", "야간"]
+
+# 제외할 키워드 (이용 제한 코트 등)
+EXCLUDE_KEYWORDS = ["65세", "전용코트"]
+
 CACHE_FILE = "/tmp/seoul_tennis_state.json"
-MEMORY_CACHE = set()
+MEMORY_CACHE = None  # None이면 서버 재시작 직후(Cold Start)를 의미
 
 
-def load_cache() -> set:
+def load_cache():
+    """이전 접수중 코트 목록 로드 (최초 실행 시 None 반환)"""
     global MEMORY_CACHE
-    if MEMORY_CACHE:
+    if MEMORY_CACHE is not None:
         return MEMORY_CACHE
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 MEMORY_CACHE = set(json.load(f))
+                return MEMORY_CACHE
         except Exception:
             pass
-    return MEMORY_CACHE
+    return None
 
 
 def save_cache(active_keys: set):
@@ -42,7 +50,7 @@ def save_cache(active_keys: set):
 
 def send_telegram(message: str) -> dict:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "Token or Chat ID missing in environment variables"}
+        return {"ok": False, "error": "Token or Chat ID missing"}
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -58,45 +66,22 @@ def send_telegram(message: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def is_excluded(place: str, svcnm: str) -> bool:
+def is_valid_court(place: str, svcnm: str) -> bool:
     """
-    서남센터(서남물재생센터) 테니스장 중 1~4번 코트만 제외하고 5번 이상 코트는 통과
-    - 매칭 예시: '서남센터 테니스장 1번 코트', '서남물재생센터 2코트', '서남 테니스장3' 등
+    1) 제외 키워드(65세, 전용코트 등)가 없고
+    2) 필수 키워드(주말, 토/일, 공휴일, 휴일, 야간)가 상품명에 명시된 코트만 통과
     """
     combined = f"{place} {svcnm}"
-    if "서남" in combined:
-        # '1번'~'4번', '1코트'~'4코트', '테니스장1'~'테니스장4', '1~4' 패턴 감지
-        # (단, 10번 등 두 자리 숫자나 날짜 '11월', '2026년' 등과 겹치지 않게 정규식 처리)
-        pattern = r"(?<![0-9])[1-4]\s*(번|코트|면)|테니스장\s*[1-4](?![0-9])|1\s*~\s*4"
-        if re.search(pattern, combined):
-            return True
-    return False
-
-
-def is_target_time(svcnm: str, v_max: str) -> bool:
-    is_weekend = any(kw in svcnm for kw in ["주말", "토/일", "공휴일", "휴일", "토요일", "일요일"])
-    is_weekday_only = "평일" in svcnm and not is_weekend
-
-    if is_weekend:
-        return True
-    if is_weekday_only and "주간" in svcnm:
+    if any(ex in combined for ex in EXCLUDE_KEYWORDS):
         return False
-
-    if v_max and ":" in v_max:
-        try:
-            end_hour = int(v_max.split(":")[0])
-            if end_hour <= 18 and is_weekday_only:
-                return False
-        except ValueError:
-            pass
-    return True
+    return any(req in svcnm for req in REQUIRED_KEYWORDS)
 
 
-def check_seoul_api() -> list:
+def fetch_seoul_courts(all_areas=False, include_closed=False) -> list:
     service_type = urllib.parse.quote("테니스장")
     url = f"http://openAPI.seoul.go.kr:8088/{SEOUL_API_KEY}/json/ListPublicReservationSport/1/1000/{service_type}"
     
-    available_items = []
+    matched_items = []
     try:
         res = requests.get(url, timeout=10)
         data = res.json()
@@ -112,25 +97,33 @@ def check_seoul_api() -> list:
             svcurl = row.get("SVCURL", "").strip()
             place = row.get("PLACENM", "").strip()
 
-            # 1. 지역 및 접수중 상태 확인
-            if area in TARGET_AREAS and stat == "접수중":
-                # 2. 서남센터 1~4번 코트만 핀셋 제외 (5번 이상 코트는 유지)
-                if is_excluded(place, svcnm):
-                    continue
-                # 3. 시간대 조건 확인
-                if is_target_time(svcnm, v_max):
-                    available_items.append({
-                        "key": svcid,
-                        "area": area,
-                        "place": place,
-                        "title": svcnm,
-                        "hours": f"{v_min}~{v_max}",
-                        "url": svcurl,
-                    })
+            # 서비스종료/접수종료는 제외
+            if stat in {"서비스종료", "접수종료"}:
+                continue
+
+            # 지역 필터 (all_areas=True면 서울시 전체 조회)
+            if not all_areas and area not in TARGET_AREAS:
+                continue
+
+            # 상태 필터 (include_closed=False면 '접수중'만 조회)
+            if not include_closed and stat != "접수중":
+                continue
+
+            # 주말/공휴일/야간 명시 코트 여부 검증
+            if is_valid_court(place, svcnm):
+                matched_items.append({
+                    "key": svcid,
+                    "area": area,
+                    "place": place,
+                    "title": svcnm,
+                    "status": stat,
+                    "hours": f"{v_min}~{v_max}",
+                    "url": svcurl,
+                })
     except Exception as e:
         print("Seoul API Error:", e)
 
-    return available_items
+    return matched_items
 
 
 class handler(BaseHTTPRequestHandler):
@@ -141,47 +134,65 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(b"Unauthorized")
             return
 
-        if "test=true" in self.path:
-            test_msg = (
-                "🎾 <b>[서울시 테니스 알리미] 텔레그램 연동 테스트 성공!</b>\n\n"
-                "• 봇 토큰 및 Chat ID가 정상 작동 중입니다.\n"
-                f"• 모니터링 대상: {', '.join(TARGET_AREAS)}\n"
-                "• 제외 조건: 서남센터 테니스장 1~4번 코트만 제외 (5번 이상 코트 포함)\n"
-                "• 기준: 평일 18시 이후 / 주말 전시간대\n"
-                f"• 확인 시각: {datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            tg_result = send_telegram(test_msg)
-            
+        # [기능 1] ?list=true 접속 시: 주말/야간으로 올라오는 코트가 어디어디 있는지 전체 조회
+        if "list=true" in self.path:
+            target_area_courts = fetch_seoul_courts(all_areas=False, include_closed=True)
+            all_seoul_courts = fetch_seoul_courts(all_areas=True, include_closed=True)
+
             self.send_response(200)
             self.send_header("Content-type", "application/json; charset=utf-8")
             self.end_headers()
             res_data = {
-                "test_mode": True,
-                "telegram_result": tg_result,
-                "token_exists": bool(TELEGRAM_BOT_TOKEN),
-                "chat_id_exists": bool(TELEGRAM_CHAT_ID),
+                "설명": "상품명에 주말/토·일/공휴일/휴일/야간이 명시된 테니스장 목록 (마감 포함)",
+                "1_내_관심지역_목록(강서/구로/마포)": [
+                    f"[{c['area']} | {c['place']}] {c['title']} ({c['status']})"
+                    for c in target_area_courts
+                ],
+                "2_서울시_전체_참고목록": [
+                    f"[{c['area']} | {c['place']}] {c['title']} ({c['status']})"
+                    for c in all_seoul_courts
+                ],
             }
-            self.wfile.write(json.dumps(res_data, ensure_ascii=False).encode("utf-8"))
+            self.wfile.write(json.dumps(res_data, ensure_ascii=False, indent=2).encode("utf-8"))
             return
 
+        # [기능 2] ?test=true 접속 시: 텔레그램 발송 테스트
+        if "test=true" in self.path:
+            test_msg = (
+                "🎾 <b>[서울시 테니스 알리미] 필터 업데이트 완료!</b>\n\n"
+                f"• 감시 지역: {', '.join(TARGET_AREAS)}\n"
+                f"• 감시 조건: 상품명에 <b>{', '.join(REQUIRED_KEYWORDS)}</b> 포함된 코트만 알림\n"
+                "• 상시 열려있는 일반 코트(서남센터 등) 무분별 알림 차단됨"
+            )
+            tg_result = send_telegram(test_msg)
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"test_mode": True, "telegram_result": tg_result}, ensure_ascii=False).encode("utf-8"))
+            return
+
+        # [기능 3] 기본 크론잡 모니터링 루틴
         prev_keys = load_cache()
-        current_items = check_seoul_api()
+        current_items = fetch_seoul_courts(all_areas=False, include_closed=False)
         current_keys = {item["key"] for item in current_items}
 
-        new_items = [item for item in current_items if item["key"] not in prev_keys]
-
         telegram_sent = False
-        if new_items:
-            lines = ["🎾 <b>[서울시 공공예약] 테니스장 접수중 감지!</b>\n"]
-            for item in new_items[:10]:
-                lines.append(
-                    f"• <b>[{item['area']} | {item['place']}]</b>\n"
-                    f"  └ {item['title']}\n"
-                    f"  └ 운영시간: {item['hours']}\n"
-                    f"  └ <a href='{item['url']}'>👉 바로 예약하러 가기</a>\n"
-                )
-            send_telegram("\n".join(lines))
-            telegram_sent = True
+        new_items = []
+
+        # 서버가 처음 켜졌을 때(prev_keys is None)는 기존 접수중 코트 알림을 보내지 않고 캐시만 초기화
+        if prev_keys is not None:
+            new_items = [item for item in current_items if item["key"] not in prev_keys]
+            if new_items:
+                lines = ["🎾 <b>[서울시 공공예약] 주말/야간 테니스장 빈자리 오픈!</b>\n"]
+                for item in new_items[:10]:
+                    lines.append(
+                        f"• <b>[{item['area']} | {item['place']}]</b>\n"
+                        f"  └ 코트명: {item['title']}\n"
+                        f"  └ 운영시간: {item['hours']}\n"
+                        f"  └ <a href='{item['url']}'>👉 바로 예약하러 가기</a>\n"
+                    )
+                send_telegram("\n".join(lines))
+                telegram_sent = True
 
         save_cache(current_keys)
 
@@ -190,11 +201,11 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         response_body = {
             "status": "ok",
-            "available_count": len(current_items),
+            "cold_start_initialized": prev_keys is None,
+            "currently_open_count": len(current_items),
             "new_alerts_sent": len(new_items),
             "telegram_sent": telegram_sent,
-            "excluded_rule": "서남센터 1~4번 코트만 제외",
-            "available_courts": [f"[{i['area']}] {i['title']}" for i in current_items],
+            "currently_open_courts": [f"[{i['area']} | {i['place']}] {i['title']}" for i in current_items],
             "timestamp": datetime.now(timezone(timedelta(hours=9))).isoformat(),
         }
-        self.wfile.write(json.dumps(response_body, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(json.dumps(response_body, ensure_ascii=False, indent=2).encode("utf-8"))
