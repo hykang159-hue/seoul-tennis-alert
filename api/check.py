@@ -5,16 +5,13 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 import requests
 
-# 환경변수 설정 (Vercel Environment Variables)
 SEOUL_API_KEY = os.environ.get("SEOUL_API_KEY", "5364436a77796d733931694d494558")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-CRON_SECRET = os.environ.get("CRON_SECRET", "")  # 선택 사항
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 TARGET_AREAS = {"강서구", "구로구", "마포구"}
 CACHE_FILE = "/tmp/seoul_tennis_state.json"
-
-# Warm 컨테이너 유지 시 중복 알림 방지용 메모리 세트
 MEMORY_CACHE = set()
 
 
@@ -41,9 +38,11 @@ def save_cache(active_keys: set):
         pass
 
 
-def send_telegram(message: str):
+def send_telegram(message: str) -> dict:
+    """텔레그램 메시지 발송 및 결과 리턴"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return {"ok": False, "error": "Token or Chat ID missing in environment variables"}
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -52,17 +51,13 @@ def send_telegram(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        return res.json()
     except Exception as e:
-        print("Telegram Send Error:", e)
+        return {"ok": False, "error": str(e)}
 
 
 def is_target_time(svcnm: str, v_max: str) -> bool:
-    """
-    필터링 조건: 주말(전시간) 또는 평일(18시 이후 운영 코트)
-    - 주말/휴일 키워드 포함 시 통과
-    - 평일 전용이면서 '주간' 키워드가 있거나 종료시간(V_MAX)이 18시 이하인 경우 제외
-    """
     is_weekend = any(kw in svcnm for kw in ["주말", "토/일", "공휴일", "휴일", "토요일", "일요일"])
     is_weekday_only = "평일" in svcnm and not is_weekend
 
@@ -101,7 +96,6 @@ def check_seoul_api() -> list:
             svcurl = row.get("SVCURL", "").strip()
             place = row.get("PLACENM", "").strip()
 
-            # 강서구, 구로구, 마포구 중 '접수중' 상태이면서 시간대 조건 부합
             if area in TARGET_AREAS and stat == "접수중":
                 if is_target_time(svcnm, v_max):
                     available_items.append({
@@ -120,19 +114,44 @@ def check_seoul_api() -> list:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # 1. 시크릿 키 검증 (설정되어 있을 경우)
         if CRON_SECRET and f"key={CRON_SECRET}" not in self.path:
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b"Unauthorized")
             return
 
+        # 2. 테스트 모드 확인 (?test=true 파라미터가 있을 때)
+        if "test=true" in self.path:
+            test_msg = (
+                "🎾 <b>[서울시 테니스 알리미] 텔레그램 연동 테스트 성공!</b>\n\n"
+                "• 봇 토큰 및 Chat ID가 정상 작동 중입니다.\n"
+                f"• 모니터링 대상: {', '.join(TARGET_AREAS)}\n"
+                f"• 기준: 평일 18시 이후 / 주말 전시간대\n"
+                f"• 확인 시각: {datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            tg_result = send_telegram(test_msg)
+            
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            res_data = {
+                "test_mode": True,
+                "telegram_result": tg_result,
+                "token_exists": bool(TELEGRAM_BOT_TOKEN),
+                "chat_id_exists": bool(TELEGRAM_CHAT_ID),
+            }
+            self.wfile.write(json.dumps(res_data, ensure_ascii=False).encode("utf-8"))
+            return
+
+        # 3. 실제 모니터링 루틴
         prev_keys = load_cache()
         current_items = check_seoul_api()
         current_keys = {item["key"] for item in current_items}
 
-        # 이전에 '접수중'이 아니었다가 새로 '접수중'으로 바뀐 코트만 필터링
         new_items = [item for item in current_items if item["key"] not in prev_keys]
 
+        telegram_sent = False
         if new_items:
             lines = ["🎾 <b>[서울시 공공예약] 테니스장 접수중 감지!</b>\n"]
             for item in new_items[:10]:
@@ -143,6 +162,7 @@ class handler(BaseHTTPRequestHandler):
                     f"  └ <a href='{item['url']}'>👉 바로 예약하러 가기</a>\n"
                 )
             send_telegram("\n".join(lines))
+            telegram_sent = True
 
         save_cache(current_keys)
 
@@ -153,6 +173,7 @@ class handler(BaseHTTPRequestHandler):
             "status": "ok",
             "available_count": len(current_items),
             "new_alerts_sent": len(new_items),
+            "telegram_sent": telegram_sent,
             "available_courts": [f"[{i['area']}] {i['title']}" for i in current_items],
             "timestamp": datetime.now(timezone(timedelta(hours=9))).isoformat(),
         }
